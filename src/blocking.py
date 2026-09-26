@@ -28,20 +28,27 @@ The output is a pair table. A submission-shaped candidate_pairs table
 
 Memory notes for Colab-sized inputs (millions of rows):
   * One country is indexed at a time, then released.
+  * Source-1 is queried in chunks. Each chunk is unioned, deduplicated,
+    written, and dropped before the next chunk starts. Candidate rows
+    are not accumulated for the whole Source-1 file.
   * Posting lists that exceed a document-frequency cap are dropped
     instead of stored, so tokens like "street" never become a giant list.
   * Character TF-IDF never materialises a Source-1 × Source-2/3 dense
     matrix. Features live in a fixed hash space; common n-grams are
-    zeroed; the index is scored in chunks.
+    zeroed; the index is scored in chunks, and queries are scored a
+    chunk at a time.
   * Candidate recall is the objective. Caps exist only to keep a single
     posting list or a single query from exhausting RAM.
 """
 from __future__ import annotations
 
 import argparse
+import array
 import gc
 import heapq
 import math
+import pickle
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -149,6 +156,9 @@ class BlockingConfig:
     tfidf_min_score: float = 0.08
     tfidf_index_chunk: int = 200_000
     tfidf_query_batch: int = 512
+    # Source-1 rows scored and written together. The full-file path never
+    # keeps more than one chunk of query results resident.
+    query_chunk_size: int = 5000
 
     stopwords: frozenset = field(default_factory=default_stopwords)
     verbose: bool = False
@@ -557,11 +567,15 @@ def _update_topk(heaps, scores, cand_ids, k: int, min_score: float) -> None:
                 heapq.heapreplace(heap, (score, cand))
 
 
-def _char_tfidf_search(index_ids: list, index_texts: list, query_texts: list, cfg: BlockingConfig) -> list:
-    """Top-K character TF-IDF hits for each query text. Aligned with `query_texts`."""
-    empty = [() for _ in query_texts]
-    if not cfg.enable_tfidf or len(index_texts) < 2 or not query_texts:
-        return empty
+def _fit_char_tfidf(index_ids: list, index_texts: list, cfg: BlockingConfig):
+    """Document-frequency and IDF for one country. None when TF-IDF is off.
+
+    The returned object keeps the target ids and transliterated names so
+    later query chunks can be scored without refitting. It does not store
+    a dense similarity matrix.
+    """
+    if not cfg.enable_tfidf or len(index_texts) < 2:
+        return None
 
     vectorizer = HashingVectorizer(
         analyzer="char_wb",
@@ -578,6 +592,7 @@ def _char_tfidf_search(index_ids: list, index_texts: list, query_texts: list, cf
         block = vectorizer.transform(index_texts[start:start + chunk])
         counted = np.bincount(block.indices, minlength=cfg.tfidf_n_features)
         doc_freq += counted.astype(np.int32, copy=False)
+        del block
 
     n_docs = len(index_texts)
     max_df = cfg.tfidf_max_df
@@ -588,14 +603,31 @@ def _char_tfidf_search(index_ids: list, index_texts: list, query_texts: list, cf
     drop = (doc_freq < min_df) | (doc_freq > max_df)
     idf[drop] = 0.0
     idf = idf.astype(np.float32, copy=False)
+    return {
+        "vectorizer": vectorizer,
+        "idf": idf,
+        "index_ids": index_ids,
+        "index_texts": index_texts,
+        "chunk": chunk,
+    }
 
+
+def _search_char_tfidf(prepared, query_texts: list, cfg: BlockingConfig, *, log: bool = True) -> list:
+    """Top-K hits for this query slice. Aligned with `query_texts`."""
+    if prepared is None or not query_texts:
+        return [() for _ in query_texts]
+
+    vectorizer = prepared["vectorizer"]
+    idf = prepared["idf"]
+    index_ids = prepared["index_ids"]
+    index_texts = prepared["index_texts"]
+    chunk = prepared["chunk"]
     heaps = [[] for _ in query_texts]
     q_batch = max(1, cfg.tfidf_query_batch)
     k = max(1, cfg.tfidf_top_k)
-
     n_chunks = math.ceil(len(index_texts) / chunk)
     for chunk_i, start in enumerate(range(0, len(index_texts), chunk), start=1):
-        if cfg.verbose:
+        if log and cfg.verbose:
             _log(cfg, f"  char tf-idf chunk {chunk_i}/{n_chunks}")
         block_ids = index_ids[start:start + chunk]
         block_matrix = _transform_hashed(index_texts[start:start + chunk], vectorizer, idf)
@@ -617,6 +649,14 @@ def _char_tfidf_search(index_ids: list, index_texts: list, query_texts: list, cf
         ordered = sorted(heap, key=lambda item: item[0], reverse=True)
         neighbours.append(tuple(cand for _, cand in ordered))
     return neighbours
+
+
+def _char_tfidf_search(index_ids: list, index_texts: list, query_texts: list, cfg: BlockingConfig) -> list:
+    """Top-K character TF-IDF hits for each query text. Aligned with `query_texts`."""
+    if not query_texts:
+        return []
+    prepared = _fit_char_tfidf(index_ids, index_texts, cfg)
+    return _search_char_tfidf(prepared, query_texts, cfg)
 
 
 def char_tfidf_candidates(index_records: list, query_records: list, cfg: BlockingConfig) -> list:
@@ -698,19 +738,33 @@ def _candidates_from_records(queries: list, index_records: list, cfg: BlockingCo
         _log(cfg, f"[{country}] indexing {len(i_recs)} targets for {len(q_recs)} queries")
         index = _build_index(i_recs, cfg)
         _log(cfg, f"[{country}] overflow dropped keys: {index.overflow}")
-        tfidf = char_tfidf_candidates(i_recs, q_recs, cfg)
+        target_ids = []
+        target_texts = []
+        for rec in i_recs:
+            if rec.trans and _is_target_id(rec.eid):
+                target_ids.append(rec.eid)
+                target_texts.append(rec.trans)
+        prepared = _fit_char_tfidf(target_ids, target_texts, cfg)
+        del target_ids, target_texts
         by_index.pop(country, None)
         del i_recs
-        for rec, tfidf_ids in zip(q_recs, tfidf):
-            found = _query_record(rec, index, tfidf_ids, cfg)
-            if not found:
-                continue
-            rule_strings = {mask: _mask_to_rules(mask) for mask in set(found.values())}
-            for cand, mask in found.items():
-                source_ids.append(rec.eid)
-                cand_ids.append(cand)
-                rules.append(rule_strings[mask])
-        del index, tfidf, q_recs
+        chunk_size = _chunk_size(cfg)
+        for start in range(0, len(q_recs), chunk_size):
+            chunk = q_recs[start:start + chunk_size]
+            tfidf = _search_char_tfidf(
+                prepared, [rec.trans for rec in chunk], cfg, log=False,
+            )
+            for rec, tfidf_ids in zip(chunk, tfidf):
+                found = _query_record(rec, index, tfidf_ids, cfg)
+                if not found:
+                    continue
+                rule_strings = {mask: _mask_to_rules(mask) for mask in set(found.values())}
+                for cand, mask in found.items():
+                    source_ids.append(rec.eid)
+                    cand_ids.append(cand)
+                    rules.append(rule_strings[mask])
+            del chunk, tfidf
+        del index, prepared, q_recs
         gc.collect()
         _log(cfg, f"[{country}] pairs so far {len(source_ids)}")
 
@@ -1040,6 +1094,19 @@ def _reservoir_queries(path: Path, countries: set | None, max_rows: int | None, 
     return [make_record(*row, cfg) for row in kept]
 
 
+def _load_truth_map(path: Path) -> dict:
+    """All ground-truth links. Evaluation only; not used to add candidates."""
+    mapping = {}
+    with path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+        if "source1_entity_id" not in header:
+            raise ValueError(f"unexpected ground-truth header in {path}: {header!r}")
+        for line in handle:
+            source_id, _, rest = line.rstrip("\n").partition("\t")
+            mapping[source_id] = {mid for mid in _parse_id_list(rest) if _is_target_id(mid)}
+    return mapping
+
+
 def _load_truth_for(path: Path, source1_ids: set) -> pd.DataFrame:
     rows = []
     with path.open(encoding="utf-8") as handle:
@@ -1155,6 +1222,267 @@ def _pairs_frame(source_ids, cand_ids, rules, queried_ids, n_index, search_same)
     return frame
 
 
+class _StreamStats:
+    """Compact counters. Candidate rows themselves are not retained."""
+
+    def __init__(self, collect_ids: bool):
+        self.n_s1 = 0
+        self.n_index = 0
+        self.n_pairs = 0
+        self.search_same = 0
+        self.counts = array.array("Q")
+        self.collect_ids = collect_ids
+        self.queried_ids = [] if collect_ids else None
+        self.found_true = {}
+
+    def add_query(self, eid: str, found: dict, truth) -> None:
+        self.n_s1 += 1
+        self.n_pairs += len(found)
+        self.counts.append(len(found))
+        if not self.collect_ids:
+            return
+        self.queried_ids.append(eid)
+        if not truth:
+            return
+        true_ids = truth.get(eid)
+        if not true_ids:
+            return
+        for cand, mask in found.items():
+            if cand in true_ids:
+                self.found_true[(eid, cand)] = _mask_to_rules(mask)
+
+
+def _chunk_size(cfg: BlockingConfig) -> int:
+    size = int(cfg.query_chunk_size)
+    if size < 1:
+        raise ValueError(f"query_chunk_size must be >= 1, got {size}")
+    return size
+
+
+def _countries_in_source1(path: Path, countries: set | None) -> list:
+    found = set()
+    seen = 0
+    for _entity_id, _name, _address, country in _iter_raw_tsv(path):
+        seen += 1
+        if countries is not None and country not in countries:
+            continue
+        found.add(country)
+    return sorted(found), seen
+
+
+def _iter_country_query_chunks(path: Path, country: str, cfg: BlockingConfig, chunk_size: int):
+    """Yield Source-1 records for one country, one chunk at a time."""
+    batch = []
+    for entity_id, name, address, row_country in _iter_raw_tsv(path):
+        if row_country != country:
+            continue
+        batch.append(make_record(entity_id, name, address, row_country, cfg))
+        if len(batch) >= chunk_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _iter_record_chunks(records: list, chunk_size: int):
+    for start in range(0, len(records), chunk_size):
+        yield records[start:start + chunk_size]
+
+
+class _TsvWriter:
+    """Append-only UTF-8 TSV. Rows are written as they are finished."""
+
+    def __init__(self, path, header: str):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.handle = path.open("w", encoding="utf-8", buffering=1024 * 1024)
+        self.handle.write(header + "\n")
+        self.rows = 0
+
+    def write(self, text: str, n_rows: int) -> None:
+        if not text:
+            return
+        self.handle.write(text)
+        self.rows += n_rows
+
+    def flush(self) -> None:
+        self.handle.flush()
+
+    def close(self) -> None:
+        self.handle.close()
+
+
+def _emit_query(eid: str, found: dict, collapsed: _TsvWriter | None, pairs: _TsvWriter | None) -> None:
+    """Write one Source-1 entity. `found` is already deduplicated by candidate id."""
+    if collapsed is not None:
+        cell = ",".join(sorted(found)) if found else ""
+        collapsed.write(f"{eid}\t{cell}\n", 1)
+    if pairs is not None and found:
+        rule_strings = {mask: _mask_to_rules(mask) for mask in set(found.values())}
+        lines = "".join(
+            f"{eid}\t{cand}\t{rule_strings[mask]}\n" for cand, mask in found.items()
+        )
+        pairs.write(lines, len(found))
+
+
+def _clean_found(eid: str, found: dict) -> dict:
+    if eid in found:
+        del found[eid]
+    stale = [cand for cand in found if not _is_target_id(cand)]
+    for cand in stale:
+        del found[cand]
+    return found
+
+
+def _spill_non_tfidf(directory: Path, ordinal: int, records: list, index: _Index, cfg: BlockingConfig) -> Path:
+    payload = []
+    for rec in records:
+        payload.append((rec.eid, rec.trans, _query_record(rec, index, (), cfg)))
+    path = directory / f"chunk_{ordinal:06d}.pkl"
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    del payload
+    return path
+
+
+def _merge_tfidf_and_emit(
+    spill_path: Path,
+    prepared,
+    cfg: BlockingConfig,
+    collapsed: _TsvWriter | None,
+    pairs: _TsvWriter | None,
+    stats: _StreamStats,
+    truth,
+) -> None:
+    with spill_path.open("rb") as handle:
+        payload = pickle.load(handle)
+    spill_path.unlink()
+    neighbours = _search_char_tfidf(
+        prepared, [trans for _eid, trans, _found in payload], cfg, log=False,
+    )
+    for (eid, _trans, found), tfidf_ids in zip(payload, neighbours):
+        if tfidf_ids:
+            _add(found, tfidf_ids, 1 << 8, budget=None, force=True)
+        found = _clean_found(eid, found)
+        _emit_query(eid, found, collapsed, pairs)
+        stats.add_query(eid, found, truth)
+    del payload, neighbours
+
+
+def _emit_chunk_without_tfidf(
+    records: list,
+    index: _Index,
+    cfg: BlockingConfig,
+    collapsed: _TsvWriter | None,
+    pairs: _TsvWriter | None,
+    stats: _StreamStats,
+    truth,
+) -> None:
+    for rec in records:
+        found = _clean_found(rec.eid, _query_record(rec, index, (), cfg))
+        _emit_query(rec.eid, found, collapsed, pairs)
+        stats.add_query(rec.eid, found, truth)
+
+
+def _stream_summary(stats: _StreamStats, truth) -> dict:
+    """Same report shape as evaluate_blocking(), built from counters."""
+    count_arr = np.asarray(stats.counts, dtype=np.int64) if stats.counts else np.zeros(1, dtype=np.int64)
+    n_pairs = int(stats.n_pairs)
+    same = int(stats.search_same)
+    full = int(stats.n_s1 * stats.n_index)
+
+    def _ratio(space):
+        if not space or not n_pairs:
+            return None
+        return space / n_pairs
+
+    def _safe(numer, denom):
+        return (numer / denom) if denom else None
+
+    summary = {
+        "n_s1": int(stats.n_s1),
+        "n_index": int(stats.n_index),
+        "n_candidate_pairs": n_pairs,
+        "search_space_same_country": same,
+        "search_space_full_cartesian": full,
+        "candidates_per_s1": {
+            "mean": float(count_arr.mean()),
+            "median": float(np.median(count_arr)),
+            "p95": float(np.percentile(count_arr, 95)),
+            "max": int(count_arr.max()),
+            "zeros": int((count_arr == 0).sum()) if stats.counts else 0,
+        },
+        "reduction_ratio_vs_same_country": _ratio(same),
+        "reduction_ratio_vs_full_cartesian": _ratio(full),
+    }
+    if truth is None or stats.queried_ids is None:
+        return summary
+
+    rule_names = [name for _, name in _RULES]
+    hits = {name: 0 for name in rule_names}
+    exclusive = {name: 0 for name in rule_names}
+    union_hits = 0
+    s2_true = s2_hit = s3_true = s3_hit = 0
+    true_links = 0
+    missed = []
+    per_s1_recall = []
+    n_with_truth = 0
+    for source_id in stats.queried_ids:
+        true_ids = truth.get(source_id, set())
+        if not true_ids:
+            continue
+        n_with_truth += 1
+        n_hit = 0
+        for mid in true_ids:
+            true_links += 1
+            is_s2 = mid.startswith("S2-")
+            if is_s2:
+                s2_true += 1
+            else:
+                s3_true += 1
+            rule_text = stats.found_true.get((source_id, mid))
+            if not rule_text:
+                if len(missed) < 15:
+                    missed.append((source_id, mid))
+                continue
+            n_hit += 1
+            union_hits += 1
+            if is_s2:
+                s2_hit += 1
+            else:
+                s3_hit += 1
+            parts = set(rule_text.split("|"))
+            for name in parts:
+                if name in hits:
+                    hits[name] += 1
+            if len(parts) == 1:
+                only = next(iter(parts))
+                if only in exclusive:
+                    exclusive[only] += 1
+        per_s1_recall.append(n_hit / len(true_ids))
+
+    summary.update({
+        "n_s1_with_truth": n_with_truth,
+        "n_true_links": true_links,
+        "n_true_links_found": union_hits,
+        "recall_union": _safe(union_hits, true_links),
+        "recall_macro_s1": float(np.mean(per_s1_recall)) if per_s1_recall else None,
+        "recall_by_rule": {name: _safe(hits[name], true_links) for name in rule_names},
+        "exclusive_recall_by_rule": {name: _safe(exclusive[name], true_links) for name in rule_names},
+        "recall_s2": _safe(s2_hit, s2_true),
+        "recall_s3": _safe(s3_hit, s3_true),
+        "n_true_s2": s2_true,
+        "n_true_s3": s3_true,
+        "missed_examples": missed,
+    })
+    return summary
+
+
+def _default_pairs_path(output_path) -> Path:
+    return Path(output_path).with_suffix(".pairs.tsv")
+
+
 def generate_candidates_from_paths(
     source1_path,
     source2_path,
@@ -1163,72 +1491,144 @@ def generate_candidates_from_paths(
     countries=None,
     max_s1: int | None = None,
     seed: int = 42,
-) -> pd.DataFrame:
-    """Same candidate table as generate_candidates(), reading TSVs directly.
+    output_path=None,
+    pairs_path=None,
+    truth=None,
+) -> dict:
+    """Stream the same blocking passes as generate_candidates(), from TSVs.
+
+    Source-1 is processed in `config.query_chunk_size` chunks. Each chunk
+    runs every blocking pass, unions and deduplicates that chunk, then
+    writes it. Candidate rows are not kept for the whole file.
+
+    `output_path`, when set, is the challenge candidate_pairs.tsv shape:
+    one row per Source-1 id, comma-separated Source-2/3 ids, empty when
+    a query has no candidates. `pairs_path` is the matcher pair table
+    (source1_entity_id, candidate_entity_id, rules). When `output_path`
+    is set and `pairs_path` is omitted, the pair table is written beside
+    it as `<stem>.pairs.tsv`.
 
     `countries` restricts the run to those labels (open set: pass whatever
     strings are in the file, including France). None means every country
-    that appears in the sampled Source-1 rows.
+    that appears in Source-1.
 
     `max_s1` reservoir-samples that many Source-1 rows after the country
-    filter. The Source-2/3 index for each country is still complete, so
-    recall is not measured against a thinned target set.
+    filter. The Source-2/3 index for each country is still complete.
 
-    Countries are indexed one at a time. The character TF-IDF matrix is
-    built only after that country's token index is released.
+    `truth` is optional and is read only to fill recall counters. It does
+    not add, drop, or reorder candidates.
+
+    Countries are indexed one at a time. When character TF-IDF is on, the
+    token index is released before the name lists are loaded; non-TF-IDF
+    hits for the country are spilled chunk by chunk and merged afterwards.
     """
     cfg = config or BlockingConfig()
+    chunk_size = _chunk_size(cfg)
     country_set = None if countries is None else {c.strip() for c in countries}
-    _log(cfg, "loading Source 1")
-    queries = _reservoir_queries(Path(source1_path), country_set, max_s1, seed, cfg)
-    by_query = _group_countries(queries)
+    source1_path = Path(source1_path)
     target_paths = [Path(source2_path), Path(source3_path)]
+    if output_path is not None and pairs_path is None:
+        pairs_path = _default_pairs_path(output_path)
 
-    source_ids = []
-    cand_ids = []
-    rules = []
-    search_same = 0
-    n_index_kept = 0
-    queried_ids = [rec.eid for rec in queries]
+    collapsed = None
+    pairs = None
+    stats = _StreamStats(collect_ids=truth is not None)
 
-    for country in sorted(by_query):
-        q_recs = by_query[country]
-        _log(cfg, f"[{country}] indexing targets for {len(q_recs):,} queries")
-        index, n_index = _stream_country_index(target_paths, country, cfg)
-        n_index_kept += n_index
-        search_same += len(q_recs) * n_index
-        _log(cfg, f"[{country}] indexed {n_index:,} overflow dropped keys: {index.overflow}")
-        partial = [(rec, _query_record(rec, index, (), cfg)) for rec in q_recs]
-        del index
-        gc.collect()
-
-        if cfg.enable_tfidf:
-            _log(cfg, f"[{country}] collecting names for character tf-idf")
-            name_ids, name_texts = _stream_country_names(target_paths, country, cfg)
-            neighbours = _char_tfidf_search(
-                name_ids, name_texts, [rec.trans for rec, _ in partial], cfg,
+    try:
+        if output_path is not None:
+            collapsed = _TsvWriter(output_path, "\t".join(SUBMISSION_COLUMNS))
+        if pairs_path is not None:
+            pairs = _TsvWriter(pairs_path, "\t".join(PAIR_COLUMNS))
+        if max_s1 is None:
+            _log(cfg, "scanning Source 1 countries")
+            country_list, scanned = _countries_in_source1(source1_path, country_set)
+            _log(cfg, f"  Source 1 scan {scanned:,} lines, {len(country_list)} countries")
+            sampled = None
+        else:
+            _log(cfg, "sampling Source 1")
+            sampled = _group_countries(
+                _reservoir_queries(source1_path, country_set, max_s1, seed, cfg)
             )
-            del name_ids, name_texts
-            for (rec, cands), tfidf_ids in zip(partial, neighbours):
-                _add(cands, tfidf_ids, 1 << 8, budget=None, force=True)
-                if rec.eid in cands:
-                    del cands[rec.eid]
-            del neighbours
+            country_list = sorted(sampled)
+
+        for country in country_list:
+            if sampled is None:
+                query_chunks = _iter_country_query_chunks(source1_path, country, cfg, chunk_size)
+                n_query_hint = "streamed"
+            else:
+                query_chunks = _iter_record_chunks(sampled.pop(country), chunk_size)
+                n_query_hint = "sampled"
+            _log(cfg, f"[{country}] indexing targets ({n_query_hint} queries, chunk={chunk_size})")
+            index, n_index = _stream_country_index(target_paths, country, cfg)
+            stats.n_index += n_index
+            _log(cfg, f"[{country}] indexed {n_index:,} overflow dropped keys: {index.overflow}")
+            n_country_queries = 0
+
+            if cfg.enable_tfidf:
+                spill_dir = Path(tempfile.mkdtemp(prefix="blocking_chunk_"))
+                spills = []
+                try:
+                    for ordinal, chunk in enumerate(query_chunks):
+                        n_country_queries += len(chunk)
+                        spills.append(_spill_non_tfidf(spill_dir, ordinal, chunk, index, cfg))
+                        del chunk
+                        gc.collect()
+                    del index
+                    gc.collect()
+                    _log(cfg, f"[{country}] collecting names for character tf-idf")
+                    name_ids, name_texts = _stream_country_names(target_paths, country, cfg)
+                    prepared = _fit_char_tfidf(name_ids, name_texts, cfg)
+                    del name_ids, name_texts
+                    gc.collect()
+                    n_spills = len(spills)
+                    for ordinal, spill_path in enumerate(spills, start=1):
+                        _log(cfg, f"[{country}] tf-idf query chunk {ordinal}/{n_spills}")
+                        _merge_tfidf_and_emit(
+                            spill_path, prepared, cfg, collapsed, pairs, stats, truth,
+                        )
+                        if collapsed is not None:
+                            collapsed.flush()
+                        if pairs is not None:
+                            pairs.flush()
+                        gc.collect()
+                    del prepared, spills
+                finally:
+                    if spill_dir.exists():
+                        for leftover in spill_dir.glob("chunk_*.pkl"):
+                            leftover.unlink(missing_ok=True)
+                        try:
+                            spill_dir.rmdir()
+                        except OSError:
+                            pass
+            else:
+                for chunk in query_chunks:
+                    n_country_queries += len(chunk)
+                    _emit_chunk_without_tfidf(chunk, index, cfg, collapsed, pairs, stats, truth)
+                    del chunk
+                    if collapsed is not None:
+                        collapsed.flush()
+                    if pairs is not None:
+                        pairs.flush()
+                    gc.collect()
+                del index
+                gc.collect()
+
+            stats.search_same += n_country_queries * n_index
+            _log(cfg, f"[{country}] pairs so far {stats.n_pairs:,}")
+            if sampled is not None and country in sampled:
+                del sampled[country]
             gc.collect()
+    finally:
+        if collapsed is not None:
+            collapsed.close()
+        if pairs is not None:
+            pairs.close()
 
-        for rec, found in partial:
-            if not found:
-                continue
-            rule_strings = {mask: _mask_to_rules(mask) for mask in set(found.values())}
-            for cand, mask in found.items():
-                source_ids.append(rec.eid)
-                cand_ids.append(cand)
-                rules.append(rule_strings[mask])
-        del partial, q_recs
-        gc.collect()
-        _log(cfg, f"[{country}] pairs so far {len(source_ids):,}")
-
-    return _pairs_frame(source_ids, cand_ids, rules, queried_ids, n_index_kept, search_same)
+    summary = _stream_summary(stats, truth)
+    summary["output_path"] = None if output_path is None else str(output_path)
+    summary["pairs_path"] = None if pairs_path is None else str(pairs_path)
+    summary["query_chunk_size"] = chunk_size
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1325,7 +1725,13 @@ def main(argv=None) -> None:
     parser.add_argument("--max-s1", type=int, default=None, help="Reservoir-sample this many Source-1 rows.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-tfidf", action="store_true")
-    parser.add_argument("--output", default=None, help="Optional candidate_pairs.tsv path.")
+    parser.add_argument("--query-chunk-size", type=int, default=5000,
+                        help="Source-1 rows per blocking chunk (default: 5000).")
+    parser.add_argument("--output", default=None, help="Optional candidate_pairs.tsv path "
+                        "(one row per Source-1 id).")
+    parser.add_argument("--pairs-output", default=None,
+                        help="Pair-level TSV with rules for the matcher. "
+                        "When --output is set and this is omitted, writes <stem>.pairs.tsv.")
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -1335,12 +1741,22 @@ def main(argv=None) -> None:
         print("self-check passed")
         return
 
+    if args.query_chunk_size < 1:
+        parser.error("--query-chunk-size must be >= 1")
+
     data_dir = resolve_dataset_dir(args.data_dir)
     split_dir = data_dir / args.split
-    cfg = BlockingConfig(enable_tfidf=not args.skip_tfidf, verbose=True)
+    cfg = BlockingConfig(
+        enable_tfidf=not args.skip_tfidf,
+        verbose=True,
+        query_chunk_size=args.query_chunk_size,
+    )
     countries = None if not args.countries else [c.strip() for c in args.countries.split(",") if c.strip()]
     prefix = "train" if args.split == "train" else "test"
-    pairs = generate_candidates_from_paths(
+    truth = None
+    if args.split == "train":
+        truth = _load_truth_map(split_dir / f"{prefix}_ground_truth.tsv")
+    summary = generate_candidates_from_paths(
         split_dir / f"{prefix}_source1.tsv",
         split_dir / f"{prefix}_source2.tsv",
         split_dir / f"{prefix}_source3.tsv",
@@ -1348,17 +1764,26 @@ def main(argv=None) -> None:
         countries=countries,
         max_s1=args.max_s1,
         seed=args.seed,
+        output_path=args.output,
+        pairs_path=args.pairs_output,
+        truth=truth,
     )
-    print(f"candidate pairs: {len(pairs):,}")
-    queried = list(pairs.attrs.get("queried_ids", []))
-    if args.split == "train":
-        truth = _load_truth_for(split_dir / f"{prefix}_ground_truth.tsv", set(queried))
-        summary = evaluate_blocking(pairs, truth, source1_ids=queried)
+    print(f"candidate pairs: {summary['n_candidate_pairs']:,}")
+    if "recall_union" in summary:
         print(format_blocking_report(summary))
-    if args.output:
-        table = to_candidate_pairs_frame(pairs, queried)
-        write_candidate_pairs_tsv(table, args.output)
-        print(f"wrote {args.output}")
+    else:
+        counts = summary["candidates_per_s1"]
+        print(
+            f"  candidates/S1 mean {counts['mean']:.1f}  "
+            f"median {counts['median']:.0f}  p95 {counts['p95']:.0f}  "
+            f"max {counts['max']}  with-none {counts['zeros']:,}"
+        )
+        print(f"  same-country search space: {summary['search_space_same_country']:,}")
+        print(f"  full cartesian space:      {summary['search_space_full_cartesian']:,}")
+    if summary["output_path"]:
+        print(f"wrote {summary['output_path']}")
+    if summary["pairs_path"]:
+        print(f"wrote {summary['pairs_path']}")
 
 
 if __name__ == "__main__":
