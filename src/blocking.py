@@ -49,6 +49,7 @@ import heapq
 import math
 import pickle
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1259,15 +1260,24 @@ def _chunk_size(cfg: BlockingConfig) -> int:
     return size
 
 
-def _countries_in_source1(path: Path, countries: set | None) -> list:
-    found = set()
+def _countries_in_source1(path: Path, countries: set | None):
+    """Country labels and Source-1 row counts. Used only to label chunk progress."""
+    counts = defaultdict(int)
     seen = 0
     for _entity_id, _name, _address, country in _iter_raw_tsv(path):
         seen += 1
         if countries is not None and country not in countries:
             continue
-        found.add(country)
-    return sorted(found), seen
+        counts[country] += 1
+    return sorted(counts), seen, counts
+
+
+def _log_chunk_complete(cfg: BlockingConfig, country: str, number: int, total: int, n_s1: int, n_pairs: int, seconds: float) -> None:
+    label = country or "∅"
+    _log(
+        cfg,
+        f"[{label}] chunk {number}/{total} complete: {n_s1} S1, {n_pairs:,} candidate pairs ({seconds:.1f}s)",
+    )
 
 
 def _iter_country_query_chunks(path: Path, country: str, cfg: BlockingConfig, chunk_size: int):
@@ -1354,10 +1364,11 @@ def _merge_tfidf_and_emit(
     pairs: _TsvWriter | None,
     stats: _StreamStats,
     truth,
-) -> None:
+) -> int:
     with spill_path.open("rb") as handle:
         payload = pickle.load(handle)
     spill_path.unlink()
+    n_s1 = len(payload)
     neighbours = _search_char_tfidf(
         prepared, [trans for _eid, trans, _found in payload], cfg, log=False,
     )
@@ -1368,6 +1379,7 @@ def _merge_tfidf_and_emit(
         _emit_query(eid, found, collapsed, pairs)
         stats.add_query(eid, found, truth)
     del payload, neighbours
+    return n_s1
 
 
 def _emit_chunk_without_tfidf(
@@ -1541,7 +1553,7 @@ def generate_candidates_from_paths(
             pairs = _TsvWriter(pairs_path, "\t".join(PAIR_COLUMNS))
         if max_s1 is None:
             _log(cfg, "scanning Source 1 countries")
-            country_list, scanned = _countries_in_source1(source1_path, country_set)
+            country_list, scanned, country_counts = _countries_in_source1(source1_path, country_set)
             _log(cfg, f"  Source 1 scan {scanned:,} lines, {len(country_list)} countries")
             sampled = None
         else:
@@ -1550,14 +1562,19 @@ def generate_candidates_from_paths(
                 _reservoir_queries(source1_path, country_set, max_s1, seed, cfg)
             )
             country_list = sorted(sampled)
+            country_counts = None
 
         for country in country_list:
             if sampled is None:
+                n_s1_country = country_counts[country]
                 query_chunks = _iter_country_query_chunks(source1_path, country, cfg, chunk_size)
                 n_query_hint = "streamed"
             else:
-                query_chunks = _iter_record_chunks(sampled.pop(country), chunk_size)
+                country_records = sampled.pop(country)
+                n_s1_country = len(country_records)
+                query_chunks = _iter_record_chunks(country_records, chunk_size)
                 n_query_hint = "sampled"
+            n_chunks = math.ceil(n_s1_country / chunk_size) if n_s1_country else 0
             _log(cfg, f"[{country}] indexing targets ({n_query_hint} queries, chunk={chunk_size})")
             index, n_index = _stream_country_index(target_paths, country, cfg)
             stats.n_index += n_index
@@ -1583,7 +1600,9 @@ def generate_candidates_from_paths(
                     n_spills = len(spills)
                     for ordinal, spill_path in enumerate(spills, start=1):
                         _log(cfg, f"[{country}] tf-idf query chunk {ordinal}/{n_spills}")
-                        _merge_tfidf_and_emit(
+                        chunk_started = time.perf_counter()
+                        pairs_before = stats.n_pairs
+                        n_s1 = _merge_tfidf_and_emit(
                             spill_path, prepared, cfg, collapsed, pairs, stats, truth,
                         )
                         if collapsed is not None:
@@ -1591,6 +1610,11 @@ def generate_candidates_from_paths(
                         if pairs is not None:
                             pairs.flush()
                         gc.collect()
+                        _log_chunk_complete(
+                            cfg, country, ordinal, n_chunks, n_s1,
+                            stats.n_pairs - pairs_before,
+                            time.perf_counter() - chunk_started,
+                        )
                     del prepared, spills
                 finally:
                     if spill_dir.exists():
@@ -1601,8 +1625,11 @@ def generate_candidates_from_paths(
                         except OSError:
                             pass
             else:
-                for chunk in query_chunks:
-                    n_country_queries += len(chunk)
+                chunk_started = time.perf_counter()
+                for chunk_index, chunk in enumerate(query_chunks, start=1):
+                    n_s1 = len(chunk)
+                    n_country_queries += n_s1
+                    pairs_before = stats.n_pairs
                     _emit_chunk_without_tfidf(chunk, index, cfg, collapsed, pairs, stats, truth)
                     del chunk
                     if collapsed is not None:
@@ -1610,6 +1637,12 @@ def generate_candidates_from_paths(
                     if pairs is not None:
                         pairs.flush()
                     gc.collect()
+                    _log_chunk_complete(
+                        cfg, country, chunk_index, n_chunks, n_s1,
+                        stats.n_pairs - pairs_before,
+                        time.perf_counter() - chunk_started,
+                    )
+                    chunk_started = time.perf_counter()
                 del index
                 gc.collect()
 
