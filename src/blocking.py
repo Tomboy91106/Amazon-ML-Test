@@ -37,8 +37,10 @@ Memory notes for Colab-sized inputs (millions of rows):
     matrix. Features live in a fixed hash space; common n-grams are
     zeroed; the index is scored in chunks, and queries are scored a
     chunk at a time.
-  * Candidate recall is the objective. Caps exist only to keep a single
-    posting list or a single query from exhausting RAM.
+  * Candidate recall is the objective. Document-frequency caps drop
+    common tokens at index time. Per-query budgets then bound how many
+    of the remaining posting-list ids a single Source-1 row may pull in.
+    A posting that does not fit the budget is skipped entirely.
 """
 from __future__ import annotations
 
@@ -124,20 +126,20 @@ class BlockingConfig:
     min_name_token_len: int = 3
     min_addr_token_len: int = 4
     # Indexed only while the posting list stays within this cap.
-    # Measured on train true pairs (document frequency inside the country):
-    #   name OR address token df <= 5_000  covers ~90% of true links
-    #   name OR address token df <= 20_000 covers ~97%
-    # Caps sit a bit higher so city/locality tokens (often df 5k–40k)
-    # still generate candidates. Common generics (road, nagar, delhi, …)
-    # fall above the cap and are not stored.
-    name_token_max_df: int = 10_000
-    addr_token_max_df: int = 40_000
-    # Per query, walk rarest tokens first. The budget is a candidate
-    # ceiling for that family, not a second df cap: a posting is taken
-    # in full or not at all.
-    name_token_budget: int = 20_000
-    addr_token_budget: int = 60_000
-    # Tokens at or under this df are always taken (cheap, usually distinctive).
+    # Common tokens above the cap are not stored. These starting caps are
+    # tighter than the previous 10_000 / 40_000 limits; confirm recall on
+    # the Kaggle subset run before treating them as final.
+    name_token_max_df: int = 1_000
+    addr_token_max_df: int = 3_000
+    # Per query, walk rarest tokens first. A posting is taken in full or
+    # not at all. The running total is a hard ceiling: a posting that does
+    # not fit is skipped, including when it is the first posting. One
+    # oversized list must not bypass the budget.
+    # Previous budgets were 20_000 / 60_000.
+    name_token_budget: int = 2_000
+    addr_token_budget: int = 3_000
+    # Tokens at or under this df are preferred. They may cross the budget
+    # by at most one posting, and that posting is at most this large.
     always_include_df: int = 50
     max_name_tokens_per_query: int = 10
     max_addr_tokens_per_query: int = 12
@@ -474,7 +476,13 @@ def _add(cands: dict, ids, bit: int, *, budget: int | None, force: bool) -> None
 
 
 def _selected_postings(tokens, index_map, *, max_tokens, budget, always_df):
-    """Rarest tokens first. Each selected posting is consumed in full."""
+    """Rarest tokens first. Each selected posting is consumed in full.
+
+    The budget bounds how many target ids this token family may add.
+    A posting larger than the remaining budget is not taken, even when
+    no posting has been selected yet. Tokens at or under `always_df`
+    may cross the ceiling by at most one posting.
+    """
     ranked = []
     for token in tokens:
         posting = index_map.get(token)
@@ -485,13 +493,14 @@ def _selected_postings(tokens, index_map, *, max_tokens, budget, always_df):
     chosen = []
     running = 0
     for df, posting in ranked[:max_tokens]:
-        if df <= always_df or running + df <= budget or running == 0:
+        if running >= budget:
+            break
+        if df <= always_df or running + df <= budget:
             chosen.append(posting)
             running += df
-            if running > budget and df > always_df:
-                break
-        else:
-            break
+            continue
+        # Later postings are at least this large, so they cannot fit either.
+        break
     return chosen
 
 
@@ -1455,8 +1464,7 @@ def _stream_summary(stats: _StreamStats, truth) -> dict:
                 s3_true += 1
             rule_text = stats.found_true.get((source_id, mid))
             if not rule_text:
-                if len(missed) < 15:
-                    missed.append((source_id, mid))
+                missed.append((source_id, mid))
                 continue
             n_hit += 1
             union_hits += 1
@@ -1480,13 +1488,16 @@ def _stream_summary(stats: _StreamStats, truth) -> dict:
         "n_true_links_found": union_hits,
         "recall_union": _safe(union_hits, true_links),
         "recall_macro_s1": float(np.mean(per_s1_recall)) if per_s1_recall else None,
+        "hits_by_rule": {name: hits[name] for name in rule_names},
+        "exclusive_hits_by_rule": {name: exclusive[name] for name in rule_names},
         "recall_by_rule": {name: _safe(hits[name], true_links) for name in rule_names},
         "exclusive_recall_by_rule": {name: _safe(exclusive[name], true_links) for name in rule_names},
         "recall_s2": _safe(s2_hit, s2_true),
         "recall_s3": _safe(s3_hit, s3_true),
         "n_true_s2": s2_true,
         "n_true_s3": s3_true,
-        "missed_examples": missed,
+        "missed_true_links": missed,
+        "missed_examples": missed[:15],
     })
     return summary
 
@@ -1668,7 +1679,40 @@ def generate_candidates_from_paths(
 # Self-check on a tiny synthetic open-set (includes France, not only US/India)
 # ---------------------------------------------------------------------------
 
+def _check_posting_budget() -> None:
+    """A single oversized posting must not bypass the per-query budget."""
+    huge = tuple(f"S2-{i}" for i in range(5_000))
+    medium = tuple(f"S2-m{i}" for i in range(80))
+    rare = tuple(f"S2-r{i}" for i in range(10))
+    cheap = tuple(f"S2-c{i}" for i in range(20))
+    index_map = {"huge": huge, "medium": medium, "rare": rare, "cheap": cheap}
+
+    only_huge = _selected_postings(["huge"], index_map, max_tokens=10, budget=100, always_df=50)
+    assert only_huge == [], only_huge
+
+    rare_and_huge = _selected_postings(
+        ["huge", "rare"], index_map, max_tokens=10, budget=100, always_df=50,
+    )
+    assert len(rare_and_huge) == 1 and len(rare_and_huge[0]) == 10, rare_and_huge
+
+    cheap_and_huge = _selected_postings(
+        ["huge", "cheap"], index_map, max_tokens=10, budget=100, always_df=50,
+    )
+    assert len(cheap_and_huge) == 1 and len(cheap_and_huge[0]) == 20, cheap_and_huge
+
+    other = tuple(f"S2-o{i}" for i in range(80))
+    two_medium = _selected_postings(
+        ["medium", "other"],
+        {"medium": medium, "other": other},
+        max_tokens=10,
+        budget=100,
+        always_df=50,
+    )
+    assert len(two_medium) == 1 and len(two_medium[0]) == 80, two_medium
+
+
 def _self_check() -> None:
+    _check_posting_budget()
     cfg = BlockingConfig(verbose=False, tfidf_top_k=5, tfidf_min_score=0.05, exact_max_fanout=50)
     source1 = pd.DataFrame([
         ["S1-exact", "Orelee Barbershop", "10 Main Street, Austin, TX", "US"],
