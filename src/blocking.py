@@ -35,8 +35,8 @@ Memory notes for Colab-sized inputs (millions of rows):
     instead of stored, so tokens like "street" never become a giant list.
   * Character TF-IDF never materialises a Source-1 × Source-2/3 dense
     matrix. Features live in a fixed hash space; common n-grams are
-    zeroed; the index is scored in chunks, and queries are scored a
-    chunk at a time.
+    zeroed. Each country's target blocks are transformed once and reused
+    for every Source-1 chunk. Queries are still scored a chunk at a time.
   * Candidate recall is the objective. Document-frequency caps drop
     common tokens at index time. Per-query budgets then bound how many
     of the remaining posting-list ids a single Source-1 row may pull in.
@@ -50,9 +50,10 @@ import gc
 import heapq
 import math
 import pickle
+import random
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -90,6 +91,22 @@ _RULES = (
     (1 << 8, RULE_CHAR_TFIDF),
 )
 
+# Report names for the passes that already exist. There is no separate
+# exact transliterated-address pass; those tokens stay inside address_token.
+_PASS_DIAG_ROWS = (
+    (1 << 0, "exact_name_basic"),
+    (1 << 1, "exact_name_core"),
+    (1 << 2, "exact_name_sorted"),
+    (1 << 3, "exact_name_translit"),
+    (1 << 4, "rare_name_token"),
+    (1 << 5, "address_token"),
+    (1 << 6, "address_number_name"),
+    (1 << 7, "address_postal"),
+    (1 << 8, "tfidf_char"),
+)
+DIAGNOSTIC_MIN_S1 = 10_000
+DIAGNOSTIC_MAX_S1 = 25_000
+
 PAIR_COLUMNS = ["source1_entity_id", "candidate_entity_id", "rules"]
 SUBMISSION_COLUMNS = ["source1_entity_id", "candidate_entity_ids"]
 
@@ -126,18 +143,18 @@ class BlockingConfig:
     min_name_token_len: int = 3
     min_addr_token_len: int = 4
     # Indexed only while the posting list stays within this cap.
-    # Common tokens above the cap are not stored. These starting caps are
-    # tighter than the previous 10_000 / 40_000 limits; confirm recall on
-    # the Kaggle subset run before treating them as final.
+    # Common tokens above the cap are not stored.
+    # Address lists were the large allowance: Kaggle emitted ~800–1,100
+    # candidates/S1 while one address posting could contribute 3,000 ids.
+    # Name caps stay at 1,000. Address caps match a single informative list.
     name_token_max_df: int = 1_000
-    addr_token_max_df: int = 3_000
+    addr_token_max_df: int = 800
     # Per query, walk rarest tokens first. A posting is taken in full or
     # not at all. The running total is a hard ceiling: a posting that does
     # not fit is skipped, including when it is the first posting. One
     # oversized list must not bypass the budget.
-    # Previous budgets were 20_000 / 60_000.
     name_token_budget: int = 2_000
-    addr_token_budget: int = 3_000
+    addr_token_budget: int = 800
     # Tokens at or under this df are preferred. They may cross the budget
     # by at most one posting, and that posting is at most this large.
     always_include_df: int = 50
@@ -165,6 +182,9 @@ class BlockingConfig:
 
     stopwords: frozenset = field(default_factory=default_stopwords)
     verbose: bool = False
+    # Count per-pass raw/unique candidates and true-match hits.
+    # Does not add, drop, or reorder candidates.
+    collect_pass_stats: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -504,12 +524,18 @@ def _selected_postings(tokens, index_map, *, max_tokens, budget, always_df):
     return chosen
 
 
-def _query_record(rec: _Record, index: _Index, tfidf_ids, cfg: BlockingConfig) -> dict:
+def _query_record(rec: _Record, index: _Index, tfidf_ids, cfg: BlockingConfig, diag=None) -> dict:
     cands = {}
-    _add(cands, index.exact_name.get(rec.basic), 1 << 0, budget=None, force=True)
-    _add(cands, index.exact_core.get(rec.core), 1 << 1, budget=None, force=True)
-    _add(cands, index.exact_sorted.get(rec.sorted_name), 1 << 2, budget=None, force=True)
-    _add(cands, index.translit_name.get(rec.trans), 1 << 3, budget=None, force=True)
+
+    def take(ids, bit: int) -> None:
+        if diag is not None and ids:
+            diag.raw[bit] += len(ids)
+        _add(cands, ids, bit, budget=None, force=True)
+
+    take(index.exact_name.get(rec.basic), 1 << 0)
+    take(index.exact_core.get(rec.core), 1 << 1)
+    take(index.exact_sorted.get(rec.sorted_name), 1 << 2)
+    take(index.translit_name.get(rec.trans), 1 << 3)
 
     for posting in _selected_postings(
         rec.name_toks, index.name_token,
@@ -517,22 +543,22 @@ def _query_record(rec: _Record, index: _Index, tfidf_ids, cfg: BlockingConfig) -
         budget=cfg.name_token_budget,
         always_df=cfg.always_include_df,
     ):
-        _add(cands, posting, 1 << 4, budget=None, force=True)
+        take(posting, 1 << 4)
     for posting in _selected_postings(
         rec.addr_toks, index.address_token,
         max_tokens=cfg.max_addr_tokens_per_query,
         budget=cfg.addr_token_budget,
         always_df=cfg.always_include_df,
     ):
-        _add(cands, posting, 1 << 5, budget=None, force=True)
+        take(posting, 1 << 5)
 
     if rec.number_key is not None:
-        _add(cands, index.address_number.get(rec.number_key), 1 << 6, budget=None, force=True)
+        take(index.address_number.get(rec.number_key), 1 << 6)
     for postal in rec.postals:
-        _add(cands, index.address_postal.get(postal), 1 << 7, budget=None, force=True)
+        take(index.address_postal.get(postal), 1 << 7)
 
     if tfidf_ids:
-        _add(cands, tfidf_ids, 1 << 8, budget=None, force=True)
+        take(tfidf_ids, 1 << 8)
 
     self_id = rec.eid
     if self_id in cands:
@@ -578,11 +604,11 @@ def _update_topk(heaps, scores, cand_ids, k: int, min_score: float) -> None:
 
 
 def _fit_char_tfidf(index_ids: list, index_texts: list, cfg: BlockingConfig):
-    """Document-frequency and IDF for one country. None when TF-IDF is off.
+    """Document-frequency, IDF, and cached sparse target blocks for one country.
 
-    The returned object keeps the target ids and transliterated names so
-    later query chunks can be scored without refitting. It does not store
-    a dense similarity matrix.
+    None when TF-IDF is off. Target names are hashed once. Later Source-1
+    chunks reuse those sparse blocks and only transform the queries.
+    Blocks stay sparse; this does not build a dense similarity matrix.
     """
     if not cfg.enable_tfidf or len(index_texts) < 2:
         return None
@@ -613,34 +639,40 @@ def _fit_char_tfidf(index_ids: list, index_texts: list, cfg: BlockingConfig):
     drop = (doc_freq < min_df) | (doc_freq > max_df)
     idf[drop] = 0.0
     idf = idf.astype(np.float32, copy=False)
+    del doc_freq
+
+    blocks = []
+    for start in range(0, n_docs, chunk):
+        block_ids = index_ids[start:start + chunk]
+        block_matrix = _transform_hashed(index_texts[start:start + chunk], vectorizer, idf)
+        blocks.append((block_ids, block_matrix))
     return {
         "vectorizer": vectorizer,
         "idf": idf,
-        "index_ids": index_ids,
-        "index_texts": index_texts,
-        "chunk": chunk,
+        "blocks": blocks,
     }
 
 
 def _search_char_tfidf(prepared, query_texts: list, cfg: BlockingConfig, *, log: bool = True) -> list:
-    """Top-K hits for this query slice. Aligned with `query_texts`."""
+    """Top-K hits for this query slice. Aligned with `query_texts`.
+
+    Scores queries against the cached target blocks from `_fit_char_tfidf`.
+    The same top-K and minimum score are applied. Target text is not
+    transformed again.
+    """
     if prepared is None or not query_texts:
         return [() for _ in query_texts]
 
     vectorizer = prepared["vectorizer"]
     idf = prepared["idf"]
-    index_ids = prepared["index_ids"]
-    index_texts = prepared["index_texts"]
-    chunk = prepared["chunk"]
+    blocks = prepared["blocks"]
     heaps = [[] for _ in query_texts]
     q_batch = max(1, cfg.tfidf_query_batch)
     k = max(1, cfg.tfidf_top_k)
-    n_chunks = math.ceil(len(index_texts) / chunk)
-    for chunk_i, start in enumerate(range(0, len(index_texts), chunk), start=1):
+    n_chunks = len(blocks)
+    for chunk_i, (block_ids, block_matrix) in enumerate(blocks, start=1):
         if log and cfg.verbose:
             _log(cfg, f"  char tf-idf chunk {chunk_i}/{n_chunks}")
-        block_ids = index_ids[start:start + chunk]
-        block_matrix = _transform_hashed(index_texts[start:start + chunk], vectorizer, idf)
         for q_start in range(0, len(query_texts), q_batch):
             query_matrix = _transform_hashed(query_texts[q_start:q_start + q_batch], vectorizer, idf)
             scores = query_matrix.dot(block_matrix.T)
@@ -652,7 +684,6 @@ def _search_char_tfidf(prepared, query_texts: list, cfg: BlockingConfig, *, log:
                 cfg.tfidf_min_score,
             )
             del query_matrix, scores
-        del block_matrix
 
     neighbours = []
     for heap in heaps:
@@ -723,6 +754,43 @@ def generate_candidates(
     return _candidates_from_records(queries, index_records, cfg)
 
 
+class _PassStats:
+    """Per-pass counters. Recording them does not change the candidate set."""
+
+    __slots__ = ("raw", "unique", "true_hits", "exclusive_true")
+
+    def __init__(self):
+        self.raw = defaultdict(int)
+        self.unique = defaultdict(int)
+        self.true_hits = defaultdict(int)
+        self.exclusive_true = defaultdict(int)
+
+    def observe(self, found: dict, true_ids) -> None:
+        true_set = set() if not true_ids else set(true_ids)
+        for cand, mask in found.items():
+            bits = [bit for bit, _name in _PASS_DIAG_ROWS if mask & bit]
+            for bit in bits:
+                self.unique[bit] += 1
+            if cand not in true_set:
+                continue
+            for bit in bits:
+                self.true_hits[bit] += 1
+            if len(bits) == 1:
+                self.exclusive_true[bits[0]] += 1
+
+    def rows(self) -> list:
+        return [
+            {
+                "pass": name,
+                "raw_candidates": int(self.raw[bit]),
+                "unique_candidates": int(self.unique[bit]),
+                "true_matches_retrieved": int(self.true_hits[bit]),
+                "unique_true_matches_contributed": int(self.exclusive_true[bit]),
+            }
+            for bit, name in _PASS_DIAG_ROWS
+        ]
+
+
 def _candidates_from_records(queries: list, index_records: list, cfg: BlockingConfig) -> pd.DataFrame:
     by_query = _group_countries(queries)
     by_index = _group_countries(index_records)
@@ -736,6 +804,7 @@ def _candidates_from_records(queries: list, index_records: list, cfg: BlockingCo
     # Every queried id, including ones that receive zero candidates.
     # Dropping those would make recall look better than it is.
     queried_ids = [rec.eid for rec in queries]
+    diag = _PassStats() if cfg.collect_pass_stats else None
 
     for country in countries:
         q_recs = by_query.get(country, [])
@@ -765,7 +834,9 @@ def _candidates_from_records(queries: list, index_records: list, cfg: BlockingCo
                 prepared, [rec.trans for rec in chunk], cfg, log=False,
             )
             for rec, tfidf_ids in zip(chunk, tfidf):
-                found = _query_record(rec, index, tfidf_ids, cfg)
+                found = _query_record(rec, index, tfidf_ids, cfg, diag)
+                if diag is not None:
+                    diag.observe(found, None)
                 if not found:
                     continue
                 rule_strings = {mask: _mask_to_rules(mask) for mask in set(found.values())}
@@ -793,6 +864,8 @@ def _candidates_from_records(queries: list, index_records: list, cfg: BlockingCo
         "search_space_full_cartesian": int(n_s1 * n_index),
     }
     frame.attrs["queried_ids"] = queried_ids
+    if diag is not None:
+        frame.attrs["pass_diagnostics"] = diag.rows()
     return frame
 
 
@@ -1130,6 +1203,165 @@ def _load_truth_for(path: Path, source1_ids: set) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["source1_entity_id", "matched_entity_ids"])
 
 
+def _truth_map_for_ids(path: Path, source_ids: set) -> dict:
+    """Ground-truth links for a Source-1 subset. Missing ids stay empty sets."""
+    mapping = {eid: set() for eid in source_ids}
+    with path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+        if "source1_entity_id" not in header:
+            raise ValueError(f"unexpected ground-truth header in {path}: {header!r}")
+        for line in handle:
+            source_id, _, rest = line.rstrip("\n").partition("\t")
+            if source_id not in mapping:
+                continue
+            mapping[source_id] = {mid for mid in _parse_id_list(rest) if _is_target_id(mid)}
+    return mapping
+
+
+def _allocate_strata(counts: dict, max_s1: int) -> dict:
+    """Largest-remainder allocation. Every non-empty stratum is represented when it fits."""
+    total = sum(counts.values())
+    positive = {key: count for key, count in counts.items() if count > 0}
+    if total <= max_s1:
+        return positive
+    keys = sorted(positive, key=lambda key: (-positive[key], str(key[0]), key[1]))
+    if len(keys) > max_s1:
+        keys = keys[:max_s1]
+    alloc = {key: 1 for key in keys}
+    remaining = max_s1 - len(keys)
+    room = {key: positive[key] - alloc[key] for key in keys}
+    weighted = [key for key in keys if room[key] > 0]
+    if remaining > 0 and weighted:
+        weight_sum = sum(room[key] for key in weighted)
+        raw = {key: remaining * room[key] / weight_sum for key in weighted}
+        floors = {key: min(room[key], int(math.floor(raw[key]))) for key in weighted}
+        leftover = remaining - sum(floors.values())
+        order = sorted(
+            weighted,
+            key=lambda key: (raw[key] - math.floor(raw[key]), positive[key]),
+            reverse=True,
+        )
+        for key in order:
+            if leftover <= 0:
+                break
+            if floors[key] >= room[key]:
+                continue
+            floors[key] += 1
+            leftover -= 1
+        for key, extra in floors.items():
+            alloc[key] += extra
+    short = max_s1 - sum(alloc.values())
+    if short > 0:
+        for key in keys:
+            space = positive[key] - alloc[key]
+            if space <= 0:
+                continue
+            take = min(space, short)
+            alloc[key] += take
+            short -= take
+            if short == 0:
+                break
+    return alloc
+
+
+def sample_diagnostic_rows(source1_path, truth_path, max_s1: int, seed: int = 42, countries=None):
+    """Stratified Source-1 sample across country and zero/singleton/multi match.
+
+    Reservoir within each stratum. This does not take the first rows of the file.
+    Returns (raw rows, profile). Raw rows are (entity_id, name, address, country).
+    """
+    if max_s1 < 1:
+        raise ValueError(f"max_s1 must be >= 1, got {max_s1}")
+    source1_path = Path(source1_path)
+    truth_path = Path(truth_path)
+    country_set = None if countries is None else {str(c).strip() for c in countries}
+    cards = {}
+    with truth_path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+        if "source1_entity_id" not in header:
+            raise ValueError(f"unexpected ground-truth header in {truth_path}: {header!r}")
+        for line in handle:
+            source_id, _, rest = line.rstrip("\n").partition("\t")
+            n_links = len([mid for mid in _parse_id_list(rest) if _is_target_id(mid)])
+            if n_links <= 0:
+                cards[source_id] = "zero"
+            elif n_links == 1:
+                cards[source_id] = "singleton"
+            else:
+                cards[source_id] = "multi"
+
+    counts = defaultdict(int)
+    eligible = 0
+    for entity_id, _name, _address, country in _iter_raw_tsv(source1_path):
+        if country_set is not None and country not in country_set:
+            continue
+        eligible += 1
+        counts[(country, cards.get(entity_id, "zero"))] += 1
+    alloc = _allocate_strata(dict(counts), max_s1)
+    rng = random.Random(seed)
+    kept = {key: [] for key in alloc}
+    seen = defaultdict(int)
+    for row in _iter_raw_tsv(source1_path):
+        entity_id, _name, _address, country = row
+        if country_set is not None and country not in country_set:
+            continue
+        key = (country, cards.get(entity_id, "zero"))
+        quota = alloc.get(key, 0)
+        if quota <= 0:
+            continue
+        seen[key] += 1
+        bucket = kept[key]
+        if len(bucket) < quota:
+            bucket.append(row)
+        else:
+            slot = rng.randrange(seen[key])
+            if slot < quota:
+                bucket[slot] = row
+
+    profile = {
+        "n_s1": 0,
+        "eligible_s1": eligible,
+        "countries": {},
+        "match_cardinality": {"zero": 0, "singleton": 0, "multi": 0},
+    }
+    rows = []
+    for key in sorted(kept, key=lambda item: (str(item[0]), item[1])):
+        bucket = kept[key]
+        country, card = key
+        profile["countries"][country] = profile["countries"].get(country, 0) + len(bucket)
+        profile["match_cardinality"][card] += len(bucket)
+        profile["n_s1"] += len(bucket)
+        rows.extend(bucket)
+    return rows, profile
+
+
+def format_pass_diagnostics(summary: dict) -> str:
+    """Text table for --diagnose. exact_addr_translit is not a V2 pass."""
+    lines = [
+        "Per-pass diagnostics",
+        "  exact_addr_translit: not a separate pass; transliterated address tokens are inside address_token",
+        f"  {'pass':22} {'raw':>12} {'unique':>12} {'true':>10} {'exclusive_true':>16}",
+    ]
+    for row in summary.get("pass_diagnostics") or []:
+        lines.append(
+            f"  {row['pass']:22} {row['raw_candidates']:12,} {row['unique_candidates']:12,} "
+            f"{row['true_matches_retrieved']:10,} {row['unique_true_matches_contributed']:16,}"
+        )
+    if "recall_union" in summary:
+        lines.append(
+            f"  overall candidate recall: {summary['n_true_links_found']:,}/"
+            f"{summary['n_true_links']:,} = {summary['recall_union']}"
+        )
+    counts = summary.get("candidates_per_s1")
+    if counts:
+        lines.append(
+            "  candidates/S1 "
+            f"avg {counts['mean']:.1f}  median {counts['median']:.0f}  "
+            f"p95 {counts['p95']:.0f}  max {counts['max']}"
+        )
+    return "\n".join(lines)
+
+
 def _stream_country_index(paths, country: str, cfg: BlockingConfig):
     """Build one country's inverted index without retaining row objects.
 
@@ -1245,16 +1477,18 @@ class _StreamStats:
         self.queried_ids = [] if collect_ids else None
         self.found_true = {}
 
-    def add_query(self, eid: str, found: dict, truth) -> None:
+    def add_query(self, eid: str, found: dict, truth, diag=None) -> None:
         self.n_s1 += 1
         self.n_pairs += len(found)
         self.counts.append(len(found))
+        true_ids = None
+        if truth:
+            true_ids = truth.get(eid) or set()
+        if diag is not None:
+            diag.observe(found, true_ids)
         if not self.collect_ids:
             return
         self.queried_ids.append(eid)
-        if not truth:
-            return
-        true_ids = truth.get(eid)
         if not true_ids:
             return
         for cand, mask in found.items():
@@ -1354,10 +1588,10 @@ def _clean_found(eid: str, found: dict) -> dict:
     return found
 
 
-def _spill_non_tfidf(directory: Path, ordinal: int, records: list, index: _Index, cfg: BlockingConfig) -> Path:
+def _spill_non_tfidf(directory: Path, ordinal: int, records: list, index: _Index, cfg: BlockingConfig, diag=None) -> Path:
     payload = []
     for rec in records:
-        payload.append((rec.eid, rec.trans, _query_record(rec, index, (), cfg)))
+        payload.append((rec.eid, rec.trans, _query_record(rec, index, (), cfg, diag)))
     path = directory / f"chunk_{ordinal:06d}.pkl"
     with path.open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1373,6 +1607,7 @@ def _merge_tfidf_and_emit(
     pairs: _TsvWriter | None,
     stats: _StreamStats,
     truth,
+    diag=None,
 ) -> int:
     with spill_path.open("rb") as handle:
         payload = pickle.load(handle)
@@ -1383,10 +1618,12 @@ def _merge_tfidf_and_emit(
     )
     for (eid, _trans, found), tfidf_ids in zip(payload, neighbours):
         if tfidf_ids:
+            if diag is not None:
+                diag.raw[1 << 8] += len(tfidf_ids)
             _add(found, tfidf_ids, 1 << 8, budget=None, force=True)
         found = _clean_found(eid, found)
         _emit_query(eid, found, collapsed, pairs)
-        stats.add_query(eid, found, truth)
+        stats.add_query(eid, found, truth, diag)
     del payload, neighbours
     return n_s1
 
@@ -1399,11 +1636,12 @@ def _emit_chunk_without_tfidf(
     pairs: _TsvWriter | None,
     stats: _StreamStats,
     truth,
+    diag=None,
 ) -> None:
     for rec in records:
-        found = _clean_found(rec.eid, _query_record(rec, index, (), cfg))
+        found = _clean_found(rec.eid, _query_record(rec, index, (), cfg, diag))
         _emit_query(rec.eid, found, collapsed, pairs)
-        stats.add_query(rec.eid, found, truth)
+        stats.add_query(rec.eid, found, truth, diag)
 
 
 def _stream_summary(stats: _StreamStats, truth) -> dict:
@@ -1517,6 +1755,7 @@ def generate_candidates_from_paths(
     output_path=None,
     pairs_path=None,
     truth=None,
+    prepared_queries=None,
 ) -> dict:
     """Stream the same blocking passes as generate_candidates(), from TSVs.
 
@@ -1537,6 +1776,8 @@ def generate_candidates_from_paths(
 
     `max_s1` reservoir-samples that many Source-1 rows after the country
     filter. The Source-2/3 index for each country is still complete.
+    `prepared_queries`, when set, is that Source-1 sample already chosen
+    (diagnostic stratification). It is not combined with `max_s1`.
 
     `truth` is optional and is read only to fill recall counters. It does
     not add, drop, or reorder candidates.
@@ -1556,13 +1797,21 @@ def generate_candidates_from_paths(
     collapsed = None
     pairs = None
     stats = _StreamStats(collect_ids=truth is not None)
+    diag = _PassStats() if cfg.collect_pass_stats else None
+    if prepared_queries is not None and max_s1 is not None:
+        raise ValueError("pass prepared_queries or max_s1, not both")
 
     try:
         if output_path is not None:
             collapsed = _TsvWriter(output_path, "\t".join(SUBMISSION_COLUMNS))
         if pairs_path is not None:
             pairs = _TsvWriter(pairs_path, "\t".join(PAIR_COLUMNS))
-        if max_s1 is None:
+        if prepared_queries is not None:
+            _log(cfg, f"using prepared Source-1 sample ({len(prepared_queries):,} rows)")
+            sampled = _group_countries(prepared_queries)
+            country_list = sorted(sampled)
+            country_counts = None
+        elif max_s1 is None:
             _log(cfg, "scanning Source 1 countries")
             country_list, scanned, country_counts = _countries_in_source1(source1_path, country_set)
             _log(cfg, f"  Source 1 scan {scanned:,} lines, {len(country_list)} countries")
@@ -1598,7 +1847,7 @@ def generate_candidates_from_paths(
                 try:
                     for ordinal, chunk in enumerate(query_chunks):
                         n_country_queries += len(chunk)
-                        spills.append(_spill_non_tfidf(spill_dir, ordinal, chunk, index, cfg))
+                        spills.append(_spill_non_tfidf(spill_dir, ordinal, chunk, index, cfg, diag))
                         del chunk
                         gc.collect()
                     del index
@@ -1614,7 +1863,7 @@ def generate_candidates_from_paths(
                         chunk_started = time.perf_counter()
                         pairs_before = stats.n_pairs
                         n_s1 = _merge_tfidf_and_emit(
-                            spill_path, prepared, cfg, collapsed, pairs, stats, truth,
+                            spill_path, prepared, cfg, collapsed, pairs, stats, truth, diag,
                         )
                         if collapsed is not None:
                             collapsed.flush()
@@ -1641,7 +1890,7 @@ def generate_candidates_from_paths(
                     n_s1 = len(chunk)
                     n_country_queries += n_s1
                     pairs_before = stats.n_pairs
-                    _emit_chunk_without_tfidf(chunk, index, cfg, collapsed, pairs, stats, truth)
+                    _emit_chunk_without_tfidf(chunk, index, cfg, collapsed, pairs, stats, truth, diag)
                     del chunk
                     if collapsed is not None:
                         collapsed.flush()
@@ -1672,6 +1921,8 @@ def generate_candidates_from_paths(
     summary["output_path"] = None if output_path is None else str(output_path)
     summary["pairs_path"] = None if pairs_path is None else str(pairs_path)
     summary["query_chunk_size"] = chunk_size
+    if diag is not None:
+        summary["pass_diagnostics"] = diag.rows()
     return summary
 
 
@@ -1710,9 +1961,126 @@ def _check_posting_budget() -> None:
     )
     assert len(two_medium) == 1 and len(two_medium[0]) == 80, two_medium
 
+    defaults = BlockingConfig()
+    wide = tuple(f"S2-w{i}" for i in range(3_000))
+    street = tuple(f"S2-s{i}" for i in range(12))
+    kept = _selected_postings(
+        ["wide", "street"],
+        {"wide": wide, "street": street},
+        max_tokens=defaults.max_addr_tokens_per_query,
+        budget=defaults.addr_token_budget,
+        always_df=defaults.always_include_df,
+    )
+    assert kept and all(len(posting) <= defaults.addr_token_budget for posting in kept), kept
+    assert all(len(posting) != 3_000 for posting in kept)
+
+
+def _check_tfidf_cache() -> None:
+    """Target blocks are hashed once; later searches only hash queries."""
+    calls = []
+    real = _transform_hashed
+
+    def wrapped(texts, vectorizer, idf):
+        calls.append(len(texts))
+        return real(texts, vectorizer, idf)
+
+    ids = [f"S2-{i}" for i in range(9)]
+    texts = [f"alpha shop {i % 3}" for i in range(8)] + ["zzzz unique name"]
+    cfg = BlockingConfig(
+        verbose=False,
+        tfidf_index_chunk=4,
+        tfidf_query_batch=8,
+        tfidf_top_k=2,
+        tfidf_min_score=0.0,
+    )
+    globals()["_transform_hashed"] = wrapped
+    try:
+        prepared = _fit_char_tfidf(ids, texts, cfg)
+        assert prepared is not None and "blocks" in prepared
+        assert "index_texts" not in prepared
+        fit_calls = list(calls)
+        assert fit_calls == [4, 4, 1], fit_calls
+        first = _search_char_tfidf(prepared, ["alpha shop 0", "zzzz unique name"], cfg, log=False)
+        second = _search_char_tfidf(prepared, ["alpha shop 1"], cfg, log=False)
+        assert not any(size >= 4 for size in calls[len(fit_calls):]), calls
+        assert len(first) == 2 and len(second) == 1
+        assert all(len(row) <= 2 for row in first + second)
+        assert all(cand.startswith("S2-") for row in first + second for cand in row)
+    finally:
+        globals()["_transform_hashed"] = real
+
+
+def _check_diagnostic_sample() -> None:
+    """Stratified sample is not the file prefix and covers country and match type."""
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source1.tsv"
+        truth = root / "truth.tsv"
+        rows = []
+        links = []
+        # Prefix is entirely one country and zero-match, so head() would miss the rest.
+        for i in range(12):
+            rows.append(f"S1-a{i}\tAlpha Shop\t1 Main\tAlpha")
+            links.append(f"S1-a{i}\t")
+        for country, prefix in (("Beta", "b"), ("Gamma", "g")):
+            for i in range(4):
+                eid = f"S1-{prefix}z{i}"
+                rows.append(f"{eid}\tShop\t2 Main\t{country}")
+                links.append(f"{eid}\t")
+            for i in range(4):
+                eid = f"S1-{prefix}s{i}"
+                rows.append(f"{eid}\tShop\t2 Main\t{country}")
+                links.append(f"{eid}\tS2-{eid}")
+            for i in range(4):
+                eid = f"S1-{prefix}m{i}"
+                rows.append(f"{eid}\tShop\t2 Main\t{country}")
+                links.append(f"{eid}\tS2-{eid},S3-{eid}")
+        source.write_text("entity_id\tname\taddress\tcountry\n" + "\n".join(rows) + "\n", encoding="utf-8")
+        truth.write_text(
+            "source1_entity_id\tmatched_entity_ids\n" + "\n".join(links) + "\n",
+            encoding="utf-8",
+        )
+        sampled, profile = sample_diagnostic_rows(source, truth, max_s1=12, seed=7)
+        assert profile["n_s1"] == 12, profile
+        assert set(profile["countries"]) == {"Alpha", "Beta", "Gamma"}, profile
+        cards = profile["match_cardinality"]
+        assert cards["zero"] > 0 and cards["singleton"] > 0 and cards["multi"] > 0, profile
+        countries = [row[3] for row in sampled]
+        assert countries != ["Alpha"] * 12
+
+
+def _check_pass_diagnostics() -> None:
+    diag = _PassStats()
+    found = {"S2-a": (1 << 0) | (1 << 8), "S2-b": 1 << 4}
+    diag.raw[1 << 0] = 1
+    diag.raw[1 << 4] = 3
+    diag.raw[1 << 8] = 1
+    diag.observe(found, {"S2-a", "S2-b"})
+    rows = {row["pass"]: row for row in diag.rows()}
+    assert rows["exact_name_basic"]["true_matches_retrieved"] == 1
+    assert rows["exact_name_basic"]["unique_true_matches_contributed"] == 0
+    assert rows["rare_name_token"]["unique_true_matches_contributed"] == 1
+    assert rows["rare_name_token"]["raw_candidates"] == 3
+    assert rows["tfidf_char"]["true_matches_retrieved"] == 1
+    assert rows["exact_name_basic"]["unique_candidates"] == 1
+    text = format_pass_diagnostics({
+        "pass_diagnostics": diag.rows(),
+        "n_true_links_found": 2,
+        "n_true_links": 2,
+        "recall_union": 1.0,
+        "candidates_per_s1": {"mean": 2.0, "median": 2, "p95": 2, "max": 2},
+    })
+    assert "exact_addr_translit" in text
+    assert "address_token" in text
+    assert "overall candidate recall" in text
+
 
 def _self_check() -> None:
     _check_posting_budget()
+    _check_tfidf_cache()
+    _check_diagnostic_sample()
+    _check_pass_diagnostics()
     cfg = BlockingConfig(verbose=False, tfidf_top_k=5, tfidf_min_score=0.05, exact_max_fanout=50)
     source1 = pd.DataFrame([
         ["S1-exact", "Orelee Barbershop", "10 Main Street, Austin, TX", "US"],
@@ -1810,6 +2178,9 @@ def main(argv=None) -> None:
                         help="Pair-level TSV with rules for the matcher. "
                         "When --output is set and this is omitted, writes <stem>.pairs.tsv.")
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Stratified Source-1 diagnostic subset (10000-25000) with per-pass stats. "
+                        "Does not change candidate rules. Train split only.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1820,6 +2191,15 @@ def main(argv=None) -> None:
 
     if args.query_chunk_size < 1:
         parser.error("--query-chunk-size must be >= 1")
+    if args.diagnose:
+        if args.split != "train":
+            parser.error("--diagnose requires --split train so candidate recall can be measured")
+        if args.max_s1 is None:
+            args.max_s1 = 15_000
+        if not DIAGNOSTIC_MIN_S1 <= args.max_s1 <= DIAGNOSTIC_MAX_S1:
+            parser.error(
+                f"--diagnose --max-s1 must be between {DIAGNOSTIC_MIN_S1} and {DIAGNOSTIC_MAX_S1}"
+            )
 
     data_dir = resolve_dataset_dir(args.data_dir)
     split_dir = data_dir / args.split
@@ -1827,11 +2207,27 @@ def main(argv=None) -> None:
         enable_tfidf=not args.skip_tfidf,
         verbose=True,
         query_chunk_size=args.query_chunk_size,
+        collect_pass_stats=args.diagnose,
     )
     countries = None if not args.countries else [c.strip() for c in args.countries.split(",") if c.strip()]
     prefix = "train" if args.split == "train" else "test"
     truth = None
-    if args.split == "train":
+    prepared = None
+    if args.diagnose:
+        truth_path = split_dir / f"{prefix}_ground_truth.tsv"
+        source1_path = split_dir / f"{prefix}_source1.tsv"
+        rows, profile = sample_diagnostic_rows(
+            source1_path, truth_path, args.max_s1, args.seed, countries,
+        )
+        print(
+            "diagnostic sample "
+            f"n_s1={profile['n_s1']} eligible={profile['eligible_s1']} "
+            f"countries={profile['countries']} cardinality={profile['match_cardinality']}",
+            flush=True,
+        )
+        prepared = [make_record(*row, cfg) for row in rows]
+        truth = _truth_map_for_ids(truth_path, {rec.eid for rec in prepared})
+    elif args.split == "train":
         truth = _load_truth_map(split_dir / f"{prefix}_ground_truth.tsv")
     summary = generate_candidates_from_paths(
         split_dir / f"{prefix}_source1.tsv",
@@ -1839,13 +2235,16 @@ def main(argv=None) -> None:
         split_dir / f"{prefix}_source3.tsv",
         config=cfg,
         countries=countries,
-        max_s1=args.max_s1,
+        max_s1=None if args.diagnose else args.max_s1,
         seed=args.seed,
         output_path=args.output,
         pairs_path=args.pairs_output,
         truth=truth,
+        prepared_queries=prepared,
     )
     print(f"candidate pairs: {summary['n_candidate_pairs']:,}")
+    if summary.get("pass_diagnostics"):
+        print(format_pass_diagnostics(summary))
     if "recall_union" in summary:
         print(format_blocking_report(summary))
     else:
